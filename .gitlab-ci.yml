@@ -1,0 +1,237 @@
+variables:
+    DOCKER_DRIVER: overlay2
+
+cache:
+    untracked: true
+
+stages:
+  - build_test_scan
+  - run_tests
+  - deploy
+  - notifications
+
+
+# ------------------------------------------------------------------
+# Functions used in the pipeline
+# ------------------------------------------------------------------
+.functions: &import_all_functions |
+  # Generate any additional Docker Tags
+  function docker_get_tags() {
+    CI_COMMIT_BRANCH_NAME=$(echo "$CI_COMMIT_REF_NAME" | sed -r 's/\//_/g')
+    CI_COMMIT_SHA_SHORT=$(echo "$CI_COMMIT_SHA" | cut -c1-8)
+  }
+
+  # Docker Login to ECR repository
+  function docker_ecr_login() {
+    eval $(aws --region $AWS_REGION ecr get-login --no-include-email --registry-ids $AWS_ACCOUNT);
+  }
+
+  # Tag and push docker image
+  function docker_tag_and_push() {
+    TAGS=("$@");
+    for TAG in "${TAGS[@]}";
+      do
+        echo "Tagging image with '$TAG' tag and pushing to ${REPOSITORY_URI} ECR repository.";
+        docker tag ${REPOSITORY_URI}:${CI_COMMIT_SHA} ${REPOSITORY_URI}:$TAG &>> $CI_COMMIT_SHA/docker_tag_and_push.out;
+        docker push ${REPOSITORY_URI}:$TAG &>> $CI_COMMIT_SHA/docker_tag_and_push.out;
+      done;
+  }
+
+  # Tag and push docker image
+  function docker_tag_and_push() {
+    TAGS=("$@");
+    for TAG in "${TAGS[@]}";
+      do
+        echo "Tagging image with '$TAG' tag and pushing to ${REPOSITORY_URI} ECR repository.";
+        docker tag ${REPOSITORY_URI}:${CI_COMMIT_SHA} ${REPOSITORY_URI}:$TAG &>> $CI_COMMIT_SHA/docker_tag_and_push.out;
+        docker push ${REPOSITORY_URI}:$TAG &>> $CI_COMMIT_SHA/docker_tag_and_push.out;
+      done;
+  }
+
+  function post_slack_message() {
+    python3 post_slack_message.py --channel $SLACK_USER_ID --message ":x:GitLab pipeline for '$CI_PROJECT_NAME' project has failed. Please investigate $CI_PIPELINE_URL"
+  }
+
+# ------------------------------------------------------------------
+# Run Unit Tests Job Templates
+# ------------------------------------------------------------------
+.job_template: &run_unit_tests
+  image: $REPOSITORY_URI_DEPLOY:deploy
+  stage: build_test_scan
+  environment:
+    name: fapps-integration
+  script:
+    # Run your unit tests here
+    #- tox
+    - echo UNIT_TESTS_RESULT=success >> $CI_COMMIT_SHA/stage_vars
+    - echo STAGE_RESULT=Passed >> $CI_COMMIT_SHA/stage_vars
+  when: always
+  allow_failure: false
+  only:
+    - master
+    - /^feature\/.*$/
+    - /^integration\/.*$/
+    - /^hotfix.*\/.*$/
+
+# ------------------------------------------------------------------
+# Run Static/Source Code Analysis
+# ------------------------------------------------------------------
+.job_template: &static_code_analysis
+  image: $REPOSITORY_URI_DEPLOY:deploy
+  stage: build_test_scan
+  environment:
+    name: fapps-integration
+  services:
+    - docker:dind
+  script:
+    - echo "Running Static/Source Code Analysis"
+    # Run Static/Source Code Analysis HERE
+    - echo STAGE_RESULT=Passed >> $CI_COMMIT_SHA/stage_vars
+  when: always
+  allow_failure: false
+  only:
+    - master
+    - /^feature\/.*$/
+    - /^integration\/.*$/
+    - /^hotfix.*\/.*$/
+
+# ------------------------------------------------------------------
+# Build Docker Containers Job Template
+# ------------------------------------------------------------------
+.job_template: &build_containers
+  image: $REPOSITORY_URI_DEPLOY:deploy
+  stage: build_test_scan
+  environment:
+    name: fapps-integration
+  services:
+    - docker:dind
+  variables:
+    DOCKER_PRIVILEGED: "true"             # We need the container to run in a privileged state to be able to build
+  before_script:
+    - *import_all_functions               # Import common functions
+    - docker_ecr_login
+    - docker_get_tags
+    # Define list of Tags to be applied on Docker images
+    - TAGS=(${CI_COMMIT_BRANCH_NAME} ${CI_COMMIT_SHA} ${CI_COMMIT_SHA_SHORT})
+  script:
+    - cd application/
+    # Build nginx container & push to ECR repository
+    - docker build -t ${REPOSITORY_URI}:${CI_COMMIT_SHA} .
+    - docker_tag_and_push "${TAGS[@]}"
+
+# --------------------
+# Deploy job template
+# --------------------
+.job_template: &deploy
+  image: $REPOSITORY_URI_DEPLOY:deploy
+  stage: deploy
+  services:
+    - docker:dind
+  before_script:
+    - *import_all_functions               # Import common functions
+    - sync_infra_bucket
+    - docker_ecr_login
+    # Define list of Tags to be applied on Docker images
+    - TAGS=(${CI_ENVIRONMENT_NAME})
+  script:
+    # Retagging images with the environment name
+    - docker pull $REPOSITORY_URI:$CI_COMMIT_SHA
+    - docker_tag_and_push "${TAGS[@]}"
+    # Start application deployment
+    - echo "ECS Service - Force a new deployment"
+    - aws --region $AWS_REGION ecs update-service --cluster $CI_ENVIRONMENT_NAME-$CLUSTER_NAME --service $SERVICE_NAME --force-new-deployment
+    - python3 infrastructure/deployment_scripts/verify-ecs-service-redeployment.py --cluster $CI_ENVIRONMENT_NAME-$SERVICE_NAME --service $SERVICE_NAME
+
+# ---------------------------------------------
+# FAILED PIPELINE - SLACK NOTIFICATION TEMPLATE
+# ---------------------------------------------
+.job_template: &pipeline_notification
+  image: $REPOSITORY_URI_DEPLOY:deploy
+  stage: notifications
+  environment:
+    name: fapps-production
+  script:
+    # Get the current Commit Author email address
+    - COMMIT_AUTHOR_EMAIL=$(curl -skL -H "Private-Token:$GITLAB_PRODUCTION_API_TOKEN" $GITLAB_API_URL/projects/$CI_PROJECT_ID/pipelines/$CI_PIPELINE_ID/jobs | jq '.[].commit.author_email' | tail -1 | sed 's/\"//g')
+    - echo "Commit Author email address is '$COMMIT_AUTHOR_EMAIL'"
+    # Using the Author email address find its Slack user ID
+    - SLACK_USER_ID=$(curl -skL -H "Authorization:Bearer $SLACK_AUTH_TOKEN" https://fapps.slack.com/api/users.lookupByEmail?email=$COMMIT_AUTHOR_EMAIL | jq '.user.id' | sed 's/\"//g')
+    - echo "Slack user ID '$SLACK_USER_ID'"
+    # If Slack User ID doesn't start with 'U', there's probably an issue finding the commit author email or his Slack ID
+    # in this case we still want to get notified but instead post the message on 'devops' channel, so we can investigate.
+    - if [[ $SLACK_USER_ID != U* ]]; then SLACK_USER_ID=devops; fi
+    - post_slack_message
+
+
+# Run Static/Source Code Analysis
+unit_tests:
+  <<: *run_unit_tests
+  tags:
+    - fapps-integration
+
+# Run Static/Source Code Analysis
+static_code_analysis:
+  <<: *static_code_analysis
+  tags:
+    - fapps-integration
+
+# Build containers
+build_containers:
+  <<: *build_containers
+  when: always
+  allow_failure: false
+  tags:
+    - fapps-integration
+  only:
+    - master
+    - /^feature\/.*$/
+    - /^integration\/.*$/
+    - /^hotfix.*\/.*$/
+
+# _MANUAL_ deployment to fapps-UAT environment (for non-master branches)
+feature_to_uat:
+  <<: *deploy
+  environment:
+    name: fapps-uat
+  when: manual
+  allow_failure: false
+  tags:
+    - fapps-uat
+  only:
+    - /^feature\/.*$/
+    - /^integration\/.*$/
+    - /^hotfix.*\/.*$/
+
+# Automatic deployment to fapps-UAT environment (master branch)
+master_to_uat:
+  <<: *deploy
+  environment:
+    name: fapps-uat
+  when: on_success
+  allow_failure: false
+  tags:
+    - fapps-uat
+  only:
+    - master
+
+# Automatic deployment to fapps-PRODUCTION environment (master branch)
+master_to_production:
+  <<: *deploy
+  environment:
+    name: fapps-production
+  when: on_success
+  allow_failure: false
+  tags:
+    - fapps-production
+  only:
+    - master
+
+# Send a Slack notificaiton if a pipeline failed (master branch)
+pipeline_notification:
+  <<: *pipeline_notification
+  when: on_failure
+  tags:
+    - fapps-production
+  only:
+    refs:
+      - master
